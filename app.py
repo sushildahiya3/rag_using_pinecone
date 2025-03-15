@@ -5,20 +5,19 @@ from pinecone import Pinecone, ServerlessSpec
 import pdfplumber
 from docx import Document
 import pandas as pd
-import numpy as np
 import os
 import asyncio
 
 # Initialize Vipas SDK model client
 client = model.ModelClient()
-LLAMA_MODEL_ID = "mdl-b1mxve8nrq9cj"  
+LLAMA_MODEL_ID = "mdl-b1mxve8nrq9cj"
 
 # Initialize SentenceTransformer model
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Initialize Pinecone
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_3Yg7jK_My6W7E4qLhbx1LYQu2P862chHfntFFkYftCtkJxPASXUdHsbYTV1BDmjHncmTSx")
-PINECONE_ENVIRONMENT = "aws-us-east-1"  
+PINECONE_ENVIRONMENT = "aws-us-east-1"
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
 
@@ -38,7 +37,7 @@ index = pc.Index(INDEX_NAME)
 
 ### 🔹 Step 1: Stream & Chunk Documents Efficiently
 def stream_text_chunks(file, chunk_size=250):
-    """Streams text from a document in smaller chunks to reduce memory usage."""
+    """Streams text from a document in small chunks to reduce memory usage."""
     
     def process_text(text):
         """Yield text in small chunks instead of storing in memory."""
@@ -48,7 +47,7 @@ def stream_text_chunks(file, chunk_size=250):
             if len(buffer) >= chunk_size:
                 yield buffer.strip()
                 buffer = ""
-        if buffer:  # Yield any remaining text
+        if buffer:
             yield buffer.strip()
 
     try:
@@ -56,17 +55,16 @@ def stream_text_chunks(file, chunk_size=250):
             with pdfplumber.open(file) as pdf:
                 for page in pdf.pages:
                     text = page.extract_text() or ""
-                    yield from process_text(text)  # Stream chunks directly
+                    yield from process_text(text)
 
         elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             doc = Document(file)
             for para in doc.paragraphs:
-                yield from process_text(para.text)  # Stream paragraphs chunk-wise
+                yield para.text  # Yield each paragraph immediately
 
         elif file.type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
-            for chunk in pd.read_excel(file, chunksize=1):  # Process **one row at a time**
-                row_text = " ".join(str(cell) for cell in chunk.iloc[0].values)
-                yield from process_text(row_text)  # Stream row-wise
+            for chunk in pd.read_excel(file, chunksize=1):
+                yield " ".join(str(cell) for cell in chunk.iloc[0].values)  # Process row-wise
 
         else:
             yield "Unsupported file type."
@@ -75,59 +73,27 @@ def stream_text_chunks(file, chunk_size=250):
         yield f"Error processing file: {e}"
 
 ### 🔹 Step 2: Store Embeddings Without Holding in Memory
-async def store_embeddings(file, batch_size=4):
-    """Streams text chunks, generates embeddings, and stores them in Pinecone."""
-    chunks = []
-    vectors = []
-    batch_id = 0
-
-    async def upsert_data():
-        """Uploads a batch of embeddings to Pinecone asynchronously."""
-        nonlocal vectors
-        if vectors:
-            index.upsert(vectors=vectors)
-            vectors = []  # Clear memory
-
+async def store_embeddings(file):
+    """Streams text chunks, generates embeddings, and upserts them immediately to Pinecone."""
+    
     for chunk in stream_text_chunks(file):
-        chunks.append(chunk)
+        # Generate embedding for a single chunk
+        embedding = embedding_model.encode([chunk])[0].tolist()
         
-        # Generate embeddings in small batches
-        if len(chunks) >= batch_size:
-            batch_embeddings = embedding_model.encode(chunks, batch_size=batch_size)
-            vectors.extend(
-                [(f"doc_chunk_{batch_id+j}", emb.tolist(), {"text": chunks[j]}) for j, emb in enumerate(batch_embeddings)]
-            )
-            chunks = []
-            batch_id += batch_size
-
-            # Store in Pinecone without keeping embeddings in memory
-            await asyncio.get_event_loop().run_in_executor(None, upsert_data)
-
-    # Store remaining embeddings
-    if chunks:
-        batch_embeddings = embedding_model.encode(chunks, batch_size=batch_size)
-        vectors.extend(
-            [(f"doc_chunk_{batch_id+j}", emb.tolist(), {"text": chunks[j]}) for j, emb in enumerate(batch_embeddings)]
-        )
-        await asyncio.get_event_loop().run_in_executor(None, upsert_data)
+        # Upsert immediately to avoid memory holding
+        index.upsert(vectors=[(f"doc_chunk_{hash(chunk)}", embedding, {"text": chunk})])
 
 ### 🔹 Step 3: Retrieve Relevant Context Efficiently
 async def retrieve_context(query, top_k=3):
-    """Retrieves relevant chunks from Pinecone."""
-    query_embedding = embedding_model.encode([query]).tolist()[0]
-    
+    """Retrieves relevant chunks from Pinecone without holding unnecessary memory."""
     try:
-        loop = asyncio.get_event_loop()
-        results = await loop.run_in_executor(
-            None, lambda: index.query(vector=query_embedding, top_k=top_k, include_metadata=True)
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: index.query(
+                vector=embedding_model.encode([query])[0].tolist(),  # Encode directly
+                top_k=top_k, 
+                include_metadata=True
+            )
         )
-
-        if not results.matches:
-            st.warning("⚠️ No relevant context found.")
-            return ""
-
-        return " ".join([match.metadata["text"] for match in results.matches])[:170]
-
     except Exception as e:
         st.error(f"❌ Error retrieving context from Pinecone: {e}")
         return ""
@@ -185,11 +151,16 @@ if uploaded_file:
 
     if query:
         # Step 3: Retrieve relevant context
-        context = loop.run_until_complete(retrieve_context(query))
+        context_result = loop.run_until_complete(retrieve_context(query))
+
+        if context_result and context_result.matches:
+            context = " ".join([match.metadata["text"] for match in context_result.matches])[:170]
         
-        # Step 4: Query the LLM model
-        st.write("🤖 Generating response from LLM...")
-        response = query_llm(query, context)
-        
-        st.write("### ✨ Response")
-        st.write(response)
+            # Step 4: Query the LLM model
+            st.write("🤖 Generating response from LLM...")
+            response = query_llm(query, context)
+            
+            st.write("### ✨ Response")
+            st.write(response)
+        else:
+            st.warning("⚠️ No relevant context found.")
