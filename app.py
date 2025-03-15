@@ -38,45 +38,41 @@ index = pc.Index(INDEX_NAME)
 
 ### 🔹 Step 1: Stream & Chunk Documents Efficiently
 def stream_text_chunks(file, chunk_size=250):
-    """Streams text from a document in chunks to avoid loading into memory."""
-    buffer = ""
+    """Streams text from a document in smaller chunks to reduce memory usage."""
     
+    def process_text(text):
+        """Yield text in small chunks instead of storing in memory."""
+        buffer = ""
+        for line in text.split("\n"):
+            buffer += line + " "
+            if len(buffer) >= chunk_size:
+                yield buffer.strip()
+                buffer = ""
+        if buffer:  # Yield any remaining text
+            yield buffer.strip()
+
     try:
         if file.type == "application/pdf":
             with pdfplumber.open(file) as pdf:
                 for page in pdf.pages:
-                    for line in (page.extract_text() or "").split("\n"):
-                        buffer += line + " "
-                        if len(buffer) >= chunk_size:
-                            yield buffer.strip()
-                            buffer = ""
+                    text = page.extract_text() or ""
+                    yield from process_text(text)  # Stream chunks directly
 
         elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             doc = Document(file)
             for para in doc.paragraphs:
-                buffer += para.text + " "
-                if len(buffer) >= chunk_size:
-                    yield buffer.strip()
-                    buffer = ""
+                yield from process_text(para.text)  # Stream paragraphs chunk-wise
 
         elif file.type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
-            for chunk in pd.read_excel(file, chunksize=500):
-                for row in chunk.itertuples(index=False):
-                    row_text = " ".join(str(cell) for cell in row)
-                    buffer += row_text + " "
-                    if len(buffer) >= chunk_size:
-                        yield buffer.strip()
-                        buffer = ""
+            for chunk in pd.read_excel(file, chunksize=1):  # Process **one row at a time**
+                row_text = " ".join(str(cell) for cell in chunk.iloc[0].values)
+                yield from process_text(row_text)  # Stream row-wise
 
         else:
-            st.error("Unsupported file type. Please upload a PDF, DOCX, or Excel file.")
-            return
-
-        if buffer:
-            yield buffer.strip()  # Yield remaining text
+            yield "Unsupported file type."
 
     except Exception as e:
-        st.error(f"❌ Error processing file: {e}")
+        yield f"Error processing file: {e}"
 
 ### 🔹 Step 2: Store Embeddings Without Holding in Memory
 async def store_embeddings(file, batch_size=4):
