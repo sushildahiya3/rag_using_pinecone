@@ -15,7 +15,7 @@ LLAMA_MODEL_ID = "mdl-b1mxve8nrq9cj"
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Initialize Pinecone
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "your_pinecone_api_key")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_3Yg7jK_My6W7E4qLhbx1LYQu2P862chHfntFFkYftCtkJxPASXUdHsbYTV1BDmjHncmTSx")
 PINECONE_ENVIRONMENT = "aws-us-east-1"
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
