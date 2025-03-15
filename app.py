@@ -3,10 +3,9 @@ from vipas import model
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
 import pdfplumber
-from docx import Document
-import pandas as pd
 import os
 import asyncio
+import io
 
 # Initialize Vipas SDK model client
 client = model.ModelClient()
@@ -16,7 +15,7 @@ LLAMA_MODEL_ID = "mdl-b1mxve8nrq9cj"
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Initialize Pinecone
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "pcsk_3Yg7jK_My6W7E4qLhbx1LYQu2P862chHfntFFkYftCtkJxPASXUdHsbYTV1BDmjHncmTSx")
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "your_pinecone_api_key")
 PINECONE_ENVIRONMENT = "aws-us-east-1"
 
 pc = Pinecone(api_key=PINECONE_API_KEY)
@@ -35,76 +34,55 @@ if INDEX_NAME not in existing_indexes:
 
 index = pc.Index(INDEX_NAME)
 
-### 🔹 Step 1: Efficient Document Streaming
-def stream_text_chunks(file, chunk_size=250):
-    """Streams text from a document in small chunks to reduce memory usage."""
+### 🔹 **Step 1: Read PDF and Upsert While Reading**
+async def process_and_upsert_pdf(file):
+    """Extract text from a PDF page-by-page and upsert it into Pinecone."""
     
-    def process_text(text):
-        """Yield text in small chunks instead of storing in memory."""
-        buffer = []
-        for word in text.split():
-            buffer.append(word)
-            if len(" ".join(buffer)) >= chunk_size:
-                yield " ".join(buffer)
-                buffer = []
-        if buffer:
-            yield " ".join(buffer)
+    async def upsert_embedding(text, page_num):
+        """Generate embedding and upsert to Pinecone."""
+        if text.strip():  # Avoid empty pages
+            embedding = embedding_model.encode([text])[0].tolist()
+            vector_id = f"{file.name}_page_{page_num}"
+            index.upsert([
+                {
+                    "id": vector_id,
+                    "values": embedding,
+                    "metadata": {"text": text, "page": page_num, "source": file.name}
+                }
+            ])
+            print(f"✅ Upserted: {vector_id}")
 
-    try:
-        if file.type == "application/pdf":
-            with pdfplumber.open(file) as pdf:
-                for page in pdf.pages:
-                    text = page.extract_text() or ""
-                    yield from process_text(text)  # Stream chunks directly
+    with pdfplumber.open(io.BytesIO(file.read())) as pdf:
+        tasks = []
+        for page_num, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            tasks.append(upsert_embedding(text, page_num))
+        
+        # Execute all upserts asynchronously
+        await asyncio.gather(*tasks)
 
-        elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
-            doc = Document(file)
-            for para in doc.paragraphs:
-                yield from process_text(para.text)  # Stream paragraphs chunk-wise
-
-        elif file.type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
-            for chunk in pd.read_excel(file, chunksize=1):  # Process row-wise
-                row_text = " ".join(str(cell) for cell in chunk.iloc[0].values)
-                yield from process_text(row_text)  # Stream row-wise
-
-        else:
-            yield "Unsupported file type."
-
-    except Exception as e:
-        yield f"Error processing file: {e}"
-
-### 🔹 Step 2: Upsert Embeddings Without Holding in Memory
-async def store_embeddings(file):
-    """Streams text chunks, generates embeddings, and upserts them immediately to Pinecone."""
-    
-    async def upsert_embedding(text_chunk):
-        """Generate embedding and upsert it immediately."""
-        embedding = embedding_model.encode([text_chunk])[0].tolist()
-        index.upsert(vectors=[(f"doc_chunk_{hash(text_chunk)}", embedding, {"text": text_chunk})])
-
-    tasks = [upsert_embedding(chunk) for chunk in stream_text_chunks(file)]
-    await asyncio.gather(*tasks)  # Run all tasks asynchronously
-
-### 🔹 Step 3: Retrieve Context Without Holding Memory
+### 🔹 **Step 2: Retrieve Context from Pinecone**
 async def retrieve_context(query, top_k=3):
-    """Retrieves relevant chunks from Pinecone without storing extra variables."""
+    """Retrieves relevant pages from Pinecone."""
     try:
-        return await asyncio.get_event_loop().run_in_executor(
+        query_embedding = embedding_model.encode([query])[0].tolist()
+        response = await asyncio.get_event_loop().run_in_executor(
             None, lambda: index.query(
-                vector=embedding_model.encode([query])[0].tolist(),  # Encode directly
-                top_k=top_k, 
+                vector=query_embedding,
+                top_k=top_k,
                 include_metadata=True
             )
         )
+        return response if response and response.get("matches") else None
     except Exception as e:
-        st.error(f"❌ Error retrieving context from Pinecone: {e}")
-        return ""
+        st.error(f"❌ Error retrieving context: {e}")
+        return None
 
-### 🔹 Step 4: Query the Deployed LLM Model
+### 🔹 **Step 3: Query the LLM Model**
 def query_llm(query, context):
-    """Queries the LLM model using provided context."""
+    """Queries the LLM model using retrieved context."""
     prompt = (
-        "You are an expert. Answer the question using the provided context:\n\n"
+        "You are an AI assistant. Answer using the provided context:\n\n"
         f"Context: {context}\n\n"
         f"Question: {query}\n\n"
         "Answer:"
@@ -121,48 +99,47 @@ def query_llm(query, context):
     }
     
     try:
-        st.write("🤖 Querying the LLM model...")
         response = client.predict(model_id=LLAMA_MODEL_ID, input_data=payload)
         return response['outputs'][0]['data'][0]
     except Exception as e:
         st.error(f"❌ Error querying the LLM: {e}")
         return ""
 
-### 🔹 Step 5: Streamlit UI
+### 🔹 **Step 4: Streamlit UI**
 st.title("📄 RAG-based Q&A with Vipas LLM (Using Pinecone)")
-st.write("Upload a document and ask questions using the LLM.")
+st.write("Upload a document and ask questions.")
 
-# Limit file upload size to prevent OOM
-uploaded_file = st.file_uploader("📂 Upload a file (Max 5MB)", type=["pdf", "docx", "xlsx"], accept_multiple_files=False)
+uploaded_file = st.file_uploader(
+    "📂 Upload a document (Max 5MB)", 
+    type=["pdf"], 
+    accept_multiple_files=False
+)
 
 if uploaded_file:
     if uploaded_file.size > 5 * 1024 * 1024:  # 5MB limit
-        st.error("🚨 File too large! Please upload a file smaller than 5MB.")
+        st.error("🚨 File too large! Please upload a smaller file.")
         st.stop()
 
-    # Step 1: Preprocess the file
-    st.write("📖 Processing and indexing the file in chunks...")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(store_embeddings(uploaded_file))
-
-    st.success("✅ Document processed and indexed successfully!")
+    # Step 1: Process the file while upserting
+    st.write("📖 Processing and indexing the document...")
+    asyncio.run(process_and_upsert_pdf(uploaded_file))
+    st.success("✅ Document processed and indexed!")
 
     # Step 2: Accept user query
     query = st.text_input("🔍 Enter your query:")
 
     if query:
-        # Step 3: Retrieve relevant context
-        context_result = loop.run_until_complete(retrieve_context(query))
-
-        if context_result and context_result.matches:
-            context = " ".join([match.metadata["text"] for match in context_result.matches])[:170]
+        # Step 3: Retrieve context
+        context_result = asyncio.run(retrieve_context(query))
         
-            # Step 4: Query the LLM model
-            st.write("🤖 Generating response from LLM...")
+        if context_result:
+            context = " ".join([match["metadata"]["text"] for match in context_result["matches"]])[:170]
+            
+            # Step 4: Query LLM
+            st.write("🤖 Generating response...")
             response = query_llm(query, context)
             
-            st.write("### ✨ Response")
+            st.write("### ✨ AI Response")
             st.write(response)
         else:
             st.warning("⚠️ No relevant context found.")
