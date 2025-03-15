@@ -35,36 +35,37 @@ if INDEX_NAME not in existing_indexes:
 
 index = pc.Index(INDEX_NAME)
 
-### 🔹 Step 1: Stream & Chunk Documents Efficiently
+### 🔹 Step 1: Efficient Document Streaming
 def stream_text_chunks(file, chunk_size=250):
     """Streams text from a document in small chunks to reduce memory usage."""
     
     def process_text(text):
         """Yield text in small chunks instead of storing in memory."""
-        buffer = ""
-        for line in text.split("\n"):
-            buffer += line + " "
-            if len(buffer) >= chunk_size:
-                yield buffer.strip()
-                buffer = ""
+        buffer = []
+        for word in text.split():
+            buffer.append(word)
+            if len(" ".join(buffer)) >= chunk_size:
+                yield " ".join(buffer)
+                buffer = []
         if buffer:
-            yield buffer.strip()
+            yield " ".join(buffer)
 
     try:
         if file.type == "application/pdf":
             with pdfplumber.open(file) as pdf:
                 for page in pdf.pages:
                     text = page.extract_text() or ""
-                    yield from process_text(text)
+                    yield from process_text(text)  # Stream chunks directly
 
         elif file.type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
             doc = Document(file)
             for para in doc.paragraphs:
-                yield para.text  # Yield each paragraph immediately
+                yield from process_text(para.text)  # Stream paragraphs chunk-wise
 
         elif file.type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":
-            for chunk in pd.read_excel(file, chunksize=1):
-                yield " ".join(str(cell) for cell in chunk.iloc[0].values)  # Process row-wise
+            for chunk in pd.read_excel(file, chunksize=1):  # Process row-wise
+                row_text = " ".join(str(cell) for cell in chunk.iloc[0].values)
+                yield from process_text(row_text)  # Stream row-wise
 
         else:
             yield "Unsupported file type."
@@ -72,20 +73,21 @@ def stream_text_chunks(file, chunk_size=250):
     except Exception as e:
         yield f"Error processing file: {e}"
 
-### 🔹 Step 2: Store Embeddings Without Holding in Memory
+### 🔹 Step 2: Upsert Embeddings Without Holding in Memory
 async def store_embeddings(file):
     """Streams text chunks, generates embeddings, and upserts them immediately to Pinecone."""
     
-    for chunk in stream_text_chunks(file):
-        # Generate embedding for a single chunk
-        embedding = embedding_model.encode([chunk])[0].tolist()
-        
-        # Upsert immediately to avoid memory holding
-        index.upsert(vectors=[(f"doc_chunk_{hash(chunk)}", embedding, {"text": chunk})])
+    async def upsert_embedding(text_chunk):
+        """Generate embedding and upsert it immediately."""
+        embedding = embedding_model.encode([text_chunk])[0].tolist()
+        index.upsert(vectors=[(f"doc_chunk_{hash(text_chunk)}", embedding, {"text": text_chunk})])
 
-### 🔹 Step 3: Retrieve Relevant Context Efficiently
+    tasks = [upsert_embedding(chunk) for chunk in stream_text_chunks(file)]
+    await asyncio.gather(*tasks)  # Run all tasks asynchronously
+
+### 🔹 Step 3: Retrieve Context Without Holding Memory
 async def retrieve_context(query, top_k=3):
-    """Retrieves relevant chunks from Pinecone without holding unnecessary memory."""
+    """Retrieves relevant chunks from Pinecone without storing extra variables."""
     try:
         return await asyncio.get_event_loop().run_in_executor(
             None, lambda: index.query(
