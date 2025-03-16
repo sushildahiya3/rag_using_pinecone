@@ -143,7 +143,7 @@ if st.button("Submit Query") and query:
         
         with st.spinner("🤖 Generating response..."):
             response = query_llm(query, context)
-        
+        print(f"----------------{response}")
         st.session_state.query_response = response  # Store response in session state
     else:
         st.session_state.query_response = "⚠️ No relevant context found."
