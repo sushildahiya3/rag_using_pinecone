@@ -101,6 +101,7 @@ def query_llm(query, context):
     }
     
     try:
+        print(f"=========={payload}=")
         response = client.predict(model_id=LLAMA_MODEL_ID, input_data=payload)
         return response['outputs'][0]['data'][0]
     except Exception as e:
