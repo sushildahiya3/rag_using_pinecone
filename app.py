@@ -128,7 +128,8 @@ if uploaded_file:
     # Step 2: Accept user query
     query = st.text_input("🔍 Enter your query:")
 
-    if query:
+    # **Submit Button**
+    if st.button("Submit Query") and query:
         # Step 3: Retrieve context
         context_result = asyncio.run(retrieve_context(query))
         
