@@ -4,8 +4,14 @@ from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
 import pdfplumber
 import os
-import asyncio
 import io
+import asyncio
+
+# Initialize Streamlit Session State
+if "document_processed" not in st.session_state:
+    st.session_state.document_processed = False
+if "query_response" not in st.session_state:
+    st.session_state.query_response = None
 
 # Initialize Vipas SDK model client
 client = model.ModelClient()
@@ -53,13 +59,9 @@ async def process_and_upsert_pdf(file):
             print(f"✅ Upserted: {vector_id}")
 
     with pdfplumber.open(io.BytesIO(file.read())) as pdf:
-        tasks = []
         for page_num, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
-            tasks.append(upsert_embedding(text, page_num))
-        
-        # Execute all upserts asynchronously
-        await asyncio.gather(*tasks)
+            await upsert_embedding(text, page_num)
 
 ### 🔹 **Step 2: Retrieve Context from Pinecone**
 async def retrieve_context(query, top_k=3):
@@ -115,7 +117,7 @@ uploaded_file = st.file_uploader(
     accept_multiple_files=False
 )
 
-if uploaded_file:
+if uploaded_file and not st.session_state.document_processed:
     if uploaded_file.size > 5 * 1024 * 1024:  # 5MB limit
         st.error("🚨 File too large! Please upload a smaller file.")
         st.stop()
@@ -124,23 +126,29 @@ if uploaded_file:
     st.write("📖 Processing and indexing the document...")
     asyncio.run(process_and_upsert_pdf(uploaded_file))
     st.success("✅ Document processed and indexed!")
+    
+    # Set session state to prevent re-processing on reruns
+    st.session_state.document_processed = True
 
-    # Step 2: Accept user query
-    query = st.text_input("🔍 Enter your query:")
+# Step 2: Accept user query
+query = st.text_input("🔍 Enter your query:")
 
-    # **Submit Button**
-    if st.button("Submit Query") and query:
-        # Step 3: Retrieve context
+# **Submit Button**
+if st.button("Submit Query") and query:
+    with st.spinner("🔎 Retrieving relevant context..."):
         context_result = asyncio.run(retrieve_context(query))
+    
+    if context_result:
+        context = " ".join([match["metadata"]["text"] for match in context_result["matches"]])[:170]
         
-        if context_result:
-            context = " ".join([match["metadata"]["text"] for match in context_result["matches"]])[:170]
-            
-            # Step 4: Query LLM
-            st.write("🤖 Generating response...")
+        with st.spinner("🤖 Generating response..."):
             response = query_llm(query, context)
-            
-            st.write("### ✨ AI Response")
-            st.write(response)
-        else:
-            st.warning("⚠️ No relevant context found.")
+        
+        st.session_state.query_response = response  # Store response in session state
+    else:
+        st.session_state.query_response = "⚠️ No relevant context found."
+
+# Display the stored response from session state
+if st.session_state.query_response:
+    st.write("### ✨ AI Response")
+    st.write(st.session_state.query_response)
