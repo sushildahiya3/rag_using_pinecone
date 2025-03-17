@@ -56,17 +56,19 @@ async def process_and_upsert_pdf(file):
                     "metadata": {"text": text, "page": page_num, "source": file.name}
                 }
             ])
-            print(f"✅ Upserted: {vector_id}")
+            # print(f"✅ Upserted: {vector_id}")
 
     with pdfplumber.open(io.BytesIO(file.read())) as pdf:
         for page_num, page in enumerate(pdf.pages, start=1):
             text = page.extract_text() or ""
             await upsert_embedding(text, page_num)
+        print(f"PDF processsing finished.....")
 
 ### 🔹 **Step 2: Retrieve Context from Pinecone**
 async def retrieve_context(query, top_k=3):
     """Retrieves relevant pages from Pinecone."""
     try:
+        print(f"Retrieving context from pinecone......")
         query_embedding = embedding_model.encode([query])[0].tolist()
         response = await asyncio.get_event_loop().run_in_executor(
             None, lambda: index.query(
@@ -138,7 +140,7 @@ query = st.text_input("🔍 Enter your query:")
 if st.button("Submit Query") and query:
     with st.spinner("🔎 Retrieving relevant context..."):
         context_result = asyncio.run(retrieve_context(query))
-    
+    print(f"Context retrieved successfully...............")
     if context_result:
         context = " ".join([match["metadata"]["text"] for match in context_result["matches"]])[:170]
         
